@@ -10,6 +10,7 @@ class Status(Enum):
     IN_PROGRESS = "in_progress"
     COMPLETE = "complete"
     NEEDS_RESEARCH = "needs_research"
+    BLOCKED = "blocked"
     FAILED = "failed"
 
 

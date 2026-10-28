@@ -10,8 +10,7 @@ import time
 import threading
 from typing import Optional
 
-import anthropic
-
+from .llm import extract_json, text_of
 from .models import WorkOrder, Priority, Status
 from .tracker import WorkOrderTracker
 
@@ -49,14 +48,19 @@ Return a JSON array. Each element:
 
 Only return the JSON array. No other text."""
 
+_PRIORITY = {
+    "CRITICAL": Priority.CRITICAL, "HIGH": Priority.HIGH,
+    "MEDIUM": Priority.MEDIUM, "LOW": Priority.LOW,
+}
+
 
 class BloodHound:
-    def __init__(self, tracker: WorkOrderTracker, api_key: str,
-                 model: str = "claude-sonnet-4-6", interval_minutes: int = 10):
+    def __init__(self, tracker: WorkOrderTracker, client,
+                 model: str = "claude-sonnet-4-6", interval_seconds: float = 600):
         self.tracker = tracker
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = client
         self.model = model
-        self.interval = interval_minutes * 60
+        self.interval = interval_seconds
         self.cycles = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -73,23 +77,22 @@ class BloodHound:
     def run_cycle(self) -> int:
         """One research cycle. Returns number of work orders created."""
         self.cycles += 1
-        log.info(f"[Blood Hound] Research cycle #{self.cycles}")
+        log.info(f"Research cycle #{self.cycles}")
 
-        pending_titles = [wo.title for wo in self.tracker.by_status(Status.PENDING)]
-        in_progress = [f"{wo.title} (assigned to {wo.assigned_to})"
-                       for wo in self.tracker.by_status(Status.IN_PROGRESS)]
-        stats = self.tracker.stats()
+        open_titles = [wo.title for s in (Status.PENDING, Status.IN_PROGRESS, Status.BLOCKED)
+                       for wo in self.tracker.by_status(s)]
+        recent_done = [wo.title for wo in self.tracker.by_status(Status.COMPLETE)][-15:]
 
         prompt = f"""ATLAS current state:
-Pending work orders ({len(pending_titles)}):
-{chr(10).join(f'  - {t}' for t in pending_titles) or '  (none)'}
+Open work orders ({len(open_titles)}):
+{chr(10).join(f'  - {t}' for t in open_titles) or '  (none)'}
 
-In progress ({len(in_progress)}):
-{chr(10).join(f'  - {t}' for t in in_progress) or '  (none)'}
+Recently completed:
+{chr(10).join(f'  - {t}' for t in recent_done) or '  (none)'}
 
-Overall stats: {stats}
+Overall stats: {self.tracker.stats()}
 
-Hunt for 1-3 HIGH-VALUE improvements. Do not duplicate existing work orders.
+Hunt for 1-3 HIGH-VALUE improvements. Do not duplicate existing or completed work orders.
 Return JSON array only."""
 
         try:
@@ -99,39 +102,32 @@ Return JSON array only."""
                 system=_SYSTEM,
                 messages=[{"role": "user", "content": prompt}]
             )
-            text = _extract_json(resp.content[0].text)
-            orders = json.loads(text)
-
-            priority_map = {
-                "CRITICAL": Priority.CRITICAL, "HIGH": Priority.HIGH,
-                "MEDIUM": Priority.MEDIUM, "LOW": Priority.LOW
-            }
-            created = 0
+            orders = json.loads(extract_json(text_of(resp)))
             for o in orders:
                 wo = WorkOrder(
                     title=o["title"],
                     description=o["description"],
                     created_by="bloodhound",
-                    priority=priority_map.get(o.get("priority", "MEDIUM"), Priority.MEDIUM),
+                    priority=_PRIORITY.get(o.get("priority", "MEDIUM"), Priority.MEDIUM),
                     tags=o.get("tags", [])
                 )
                 self.tracker.save(wo)
-                log.info(f"  [Blood Hound] Created [{wo.id}] {wo.title}")
-                created += 1
-
-            return created
+                log.info(f"  Created [{wo.id}] {wo.title}")
+            if not orders:
+                log.info("  Nothing new worth building this cycle")
+            return len(orders)
 
         except Exception as e:
-            log.error(f"[Blood Hound] Cycle error: {e}")
+            log.error(f"Cycle error: {e}")
             return 0
 
     def research_struggle(self, work_order_id: str, struggle: str) -> Optional[str]:
-        """Called by Director when an engineer is stuck. Creates a fix work order."""
+        """Called by the Director when an engineer is stuck. Creates a fix work order."""
         wo = self.tracker.get(work_order_id)
         if not wo:
             return None
 
-        log.info(f"[Blood Hound] Researching struggle on [{work_order_id}]: {struggle[:80]}")
+        log.info(f"Researching struggle on [{work_order_id}]: {struggle[:80]}")
 
         prompt = f"""ENGINEER IS STUCK. Find the fix.
 
@@ -159,8 +155,7 @@ JSON only."""
                 system="You are Blood Hound. Create a precise fix work order to unblock the engineer.",
                 messages=[{"role": "user", "content": prompt}]
             )
-            text = _extract_json(resp.content[0].text)
-            data = json.loads(text)
+            data = json.loads(extract_json(text_of(resp)))
             fix = WorkOrder(
                 title=data["title"],
                 description=data["description"],
@@ -170,28 +165,18 @@ JSON only."""
                 tags=data.get("tags", ["fix", "unblock"])
             )
             self.tracker.save(fix)
-            log.info(f"  [Blood Hound] Fix created [{fix.id}] {fix.title}")
+            log.info(f"  Fix created [{fix.id}] {fix.title}")
             return fix.id
 
         except Exception as e:
-            log.error(f"[Blood Hound] research_struggle error: {e}")
+            log.error(f"research_struggle error: {e}")
             return None
 
     def _loop(self):
-        # Run first cycle immediately on start
         self.run_cycle()
-        elapsed = 0
+        next_run = time.monotonic() + self.interval
         while self._running:
-            time.sleep(1)
-            elapsed += 1
-            if elapsed >= self.interval:
+            time.sleep(0.5)
+            if time.monotonic() >= next_run:
                 self.run_cycle()
-                elapsed = 0
-
-
-def _extract_json(text: str) -> str:
-    if "```json" in text:
-        return text.split("```json")[1].split("```")[0].strip()
-    if "```" in text:
-        return text.split("```")[1].split("```")[0].strip()
-    return text.strip()
+                next_run = time.monotonic() + self.interval

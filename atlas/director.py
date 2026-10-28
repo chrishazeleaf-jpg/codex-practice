@@ -2,10 +2,10 @@
 FORGE DIRECTOR — ATLAS Work Order Assignment & Monitoring
 
 The Director:
-  - Assigns pending work to the right engineer
-  - Monitors in-progress work
-  - Detects struggles and escalates to Blood Hound
-  - Ensures nothing is abandoned — ever
+  - Assigns pending work to the right engineer, one order per engineer
+  - Escalates struggles to Blood Hound and parks the order as BLOCKED
+  - Returns a BLOCKED order to the queue once its fix is complete
+  - Fails an order after MAX_STRUGGLES so it surfaces to a human instead of looping
 """
 import json
 import logging
@@ -14,55 +14,41 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional, List
 
-import anthropic
-
+from .llm import extract_json, text_of
 from .models import WorkOrder, Status
 from .tracker import WorkOrderTracker
 
 log = logging.getLogger("DIRECTOR")
+
+MAX_STRUGGLES = 3
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _extract_json(text: str) -> str:
-    if "```json" in text:
-        return text.split("```json")[1].split("```")[0].strip()
-    if "```" in text:
-        return text.split("```")[1].split("```")[0].strip()
-    return text.strip()
-
-
 class ForgeDirector:
-    def __init__(self, tracker: WorkOrderTracker, api_key: str,
+    def __init__(self, tracker: WorkOrderTracker, client,
                  engineers: list, model: str = "claude-sonnet-4-6"):
         self.tracker = tracker
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = client
         self.model = model
         self.engineers = engineers
-        self.bloodhound = None  # injected by Brain after construction
+        self.bloodhound = None
         self.assigned = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
     def start(self):
         self._running = True
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="Director"
-        )
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="Director")
         self._thread.start()
-        log.info("[Director] Forge Director ONLINE")
+        log.info("Forge Director ONLINE")
 
     def stop(self):
         self._running = False
 
-    def select_engineer(self, wo: WorkOrder) -> str:
-        """Use AI to pick the best engineer. Falls back to first free engineer."""
-        free = [e for e in self.engineers if not e.current_work_order]
-        if not free:
-            return self.engineers[0].name
-
+    def select_engineer(self, wo: WorkOrder, free: list) -> str:
         if len(free) == 1:
             return free[0].name
 
@@ -89,56 +75,66 @@ Select the best engineer. Return JSON only:
                 system="You are the Forge Director. Match work orders to the best engineer.",
                 messages=[{"role": "user", "content": prompt}]
             )
-            data = json.loads(_extract_json(resp.content[0].text))
+            data = json.loads(extract_json(text_of(resp)))
             chosen = data.get("engineer", "")
             if any(e.name == chosen for e in free):
-                log.info(f"  [Director] {chosen} ← [{wo.id}] ({data.get('reason','')})")
                 return chosen
         except Exception as e:
-            log.debug(f"[Director] select_engineer fallback: {e}")
-
+            log.debug(f"select_engineer fallback: {e}")
         return free[0].name
 
     def _assign_pending(self):
-        pending = self.tracker.by_status(Status.PENDING)
-        busy = {e.name for e in self.engineers if e.current_work_order}
-
-        for wo in pending:
+        # Busy is read from the tracker, not engineer state, so an engineer that
+        # hasn't picked up its order yet is never handed a second one.
+        busy = {wo.assigned_to for wo in self.tracker.by_status(Status.IN_PROGRESS)}
+        for wo in self.tracker.by_status(Status.PENDING):
             free = [e for e in self.engineers if e.name not in busy]
             if not free:
-                break
-
-            engineer_name = self.select_engineer(wo)
-            engineer = next((e for e in free if e.name == engineer_name), free[0])
-
+                return
+            name = self.select_engineer(wo, free)
             wo.status = Status.IN_PROGRESS
-            wo.assigned_to = engineer.name
+            wo.assigned_to = name
             wo.started_at = _now()
             self.tracker.save(wo)
-            busy.add(engineer.name)
+            busy.add(name)
             self.assigned += 1
-            log.info(f"[Director] ➜ [{wo.id}] {wo.title[:50]} → {engineer.name}")
+            log.info(f"➜ [{wo.id}] {wo.title[:50]} → {name}")
 
     def _handle_struggles(self):
-        """Escalate NEEDS_RESEARCH orders to Blood Hound."""
-        struggling = self.tracker.by_status(Status.NEEDS_RESEARCH)
-        for wo in struggling:
+        for wo in self.tracker.by_status(Status.NEEDS_RESEARCH):
+            if len(wo.struggles) >= MAX_STRUGGLES:
+                wo.status = Status.FAILED
+                self.tracker.save(wo)
+                log.error(f"✗ [{wo.id}] failed after {len(wo.struggles)} struggles — needs a human")
+                continue
             if not self.bloodhound:
                 continue
-            log.warning(f"[Director] Escalating [{wo.id}] to Blood Hound")
-            last_struggle = wo.struggles[-1] if wo.struggles else "Unknown"
-            fix_id = self.bloodhound.research_struggle(wo.id, last_struggle)
+            log.warning(f"Escalating [{wo.id}] to Blood Hound")
+            fix_id = self.bloodhound.research_struggle(wo.id, wo.struggles[-1])
             if fix_id:
-                # Re-queue the original order — it will be reassigned after the fix
-                wo.status = Status.PENDING
+                wo.status = Status.BLOCKED
                 wo.assigned_to = None
                 self.tracker.save(wo)
+                log.info(f"⏸ [{wo.id}] BLOCKED until fix [{fix_id}] completes")
+
+    def _release_blocked(self):
+        for wo in self.tracker.by_status(Status.BLOCKED):
+            fixes = self.tracker.children(wo.id)
+            if any(f.status == Status.FAILED for f in fixes):
+                wo.status = Status.FAILED
+                self.tracker.save(wo)
+                log.error(f"✗ [{wo.id}] failed — its fix failed")
+            elif fixes and all(f.status == Status.COMPLETE for f in fixes):
+                wo.status = Status.PENDING
+                self.tracker.save(wo)
+                log.info(f"▶ [{wo.id}] fix landed — back in the queue to finish")
 
     def _loop(self):
         while self._running:
             try:
-                self._assign_pending()
                 self._handle_struggles()
+                self._release_blocked()
+                self._assign_pending()
             except Exception as e:
-                log.error(f"[Director] Loop error: {e}")
-            time.sleep(4)
+                log.error(f"Loop error: {e}")
+            time.sleep(2)

@@ -53,27 +53,25 @@ def get_api_key() -> str:
 
 def cmd_run(args):
     """Start the Auto Forge and run forever."""
-    import os
     os.makedirs("atlas_data", exist_ok=True)
     setup_logging(args.verbose)
     print(BANNER)
 
-    api_key = get_api_key()
-    model = args.model or "claude-sonnet-4-6"
-    interval = args.interval or 10
-
-    print(f"  Model:             {model}")
-    print(f"  Research interval: every {interval} minutes")
-    print(f"  Engineers:         FORGE-1, FORGE-2, FORGE-3")
-    print(f"  Log file:          atlas_data/atlas.log")
-    print()
-    print("  Starting Auto Forge...")
-    print()
-
+    from atlas.llm import make_client
     from atlas.brain import ATLASBrain
-    brain = ATLASBrain(api_key=api_key, model=model,
-                       research_interval_minutes=interval)
-    brain.run_forever()
+
+    client = make_client(offline=True) if args.offline else make_client(api_key=get_api_key())
+
+    print(f"  Mode:              {'OFFLINE SIMULATION (scripted responses, no API calls)' if args.offline else 'LIVE'}")
+    print(f"  Model:             {args.model}")
+    print(f"  Research interval: every {args.interval:g} minutes")
+    print(f"  Engineers:         FORGE-1, FORGE-2, FORGE-3")
+    print(f"  Results:           atlas_data/output/")
+    print()
+
+    brain = ATLASBrain(client=client, model=args.model,
+                       research_interval_seconds=args.interval * 60)
+    brain.run_forever(duration=args.duration, status_every=args.status_every)
 
 
 def cmd_status(args):
@@ -104,7 +102,7 @@ def cmd_status(args):
         print("  " + "─" * 50)
         for wo in recent:
             icon = {"pending": "⏳", "in_progress": "⚙", "complete": "✓",
-                    "needs_research": "⚠", "failed": "✗"}.get(wo.status.value, "?")
+                    "needs_research": "⚠", "blocked": "⏸", "failed": "✗"}.get(wo.status.value, "?")
             assigned = f" → {wo.assigned_to}" if wo.assigned_to else ""
             print(f"  {icon} [{wo.id}] {wo.title[:50]}{assigned}")
     print()
@@ -169,8 +167,14 @@ def main():
     # run
     p_run = sub.add_parser("run", help="Start the Auto Forge (default)")
     p_run.add_argument("--model", default="claude-sonnet-4-6", help="Anthropic model")
-    p_run.add_argument("--interval", type=int, default=10,
+    p_run.add_argument("--interval", type=float, default=10,
                        help="Blood Hound research interval in minutes")
+    p_run.add_argument("--offline", action="store_true",
+                       help="Run with a scripted stand-in model; no API key needed")
+    p_run.add_argument("--duration", type=float, default=None,
+                       help="Stop after this many seconds (default: run forever)")
+    p_run.add_argument("--status-every", type=float, default=30,
+                       help="Seconds between status lines")
     p_run.add_argument("--verbose", "-v", action="store_true")
 
     # status
@@ -188,13 +192,9 @@ def main():
     p_orders = sub.add_parser("orders", help="List work orders")
     p_orders.add_argument("--status", help="Filter by status")
 
-    args = parser.parse_args()
+    args = parser.parse_args(sys.argv[1:] or ["run"])
 
-    if not args.command or args.command == "run":
-        if not args.command:
-            args.verbose = False
-            args.model = "claude-sonnet-4-6"
-            args.interval = 10
+    if args.command == "run":
         cmd_run(args)
     elif args.command == "status":
         cmd_status(args)

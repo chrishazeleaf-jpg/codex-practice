@@ -77,6 +77,16 @@ class WorkOrderTracker:
             conn.close()
         return [self._row(r) for r in rows]
 
+    def children(self, parent_id: str) -> List[WorkOrder]:
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT * FROM work_orders WHERE parent_id=? ORDER BY created_at ASC",
+                (parent_id,)
+            ).fetchall()
+            conn.close()
+        return [self._row(r) for r in rows]
+
     def all(self) -> List[WorkOrder]:
         with self._lock:
             conn = self._conn()
