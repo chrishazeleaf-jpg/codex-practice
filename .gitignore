@@ -1,3 +1,5 @@
 atlas/__pycache__
 atlas_data/
 atlas_venv/
+__pycache__/
+.pytest_cache/

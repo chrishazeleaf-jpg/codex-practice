@@ -29,11 +29,12 @@ def _now() -> str:
 
 class ForgeDirector:
     def __init__(self, tracker: WorkOrderTracker, client,
-                 engineers: list, model: str = "claude-sonnet-4-6"):
+                 engineers: list, model: str = "claude-opus-5-5", poll: float = 2.0):
         self.tracker = tracker
         self.client = client
         self.model = model
         self.engineers = engineers
+        self.poll = poll
         self.bloodhound = None
         self.assigned = 0
         self._running = False
@@ -69,11 +70,12 @@ Select the best engineer. Return JSON only:
 {{"engineer": "<name>", "reason": "<one sentence>"}}"""
 
         try:
-            resp = self.client.messages.create(
+            resp = self.client.create(
                 model=self.model,
-                max_tokens=150,
+                max_tokens=2000,
                 system="You are the Forge Director. Match work orders to the best engineer.",
-                messages=[{"role": "user", "content": prompt}]
+                messages=[{"role": "user", "content": prompt}],
+                effort="low",
             )
             data = json.loads(extract_json(text_of(resp)))
             chosen = data.get("engineer", "")
@@ -137,4 +139,4 @@ Select the best engineer. Return JSON only:
                 self._assign_pending()
             except Exception as e:
                 log.error(f"Loop error: {e}")
-            time.sleep(2)
+            time.sleep(self.poll)

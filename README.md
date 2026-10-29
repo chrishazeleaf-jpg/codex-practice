@@ -1,38 +1,39 @@
-# codex-practice
+# ATLAS
 
-## Pushing a Local Repo to GitHub
+A personal AI that builds itself. See [ROADMAP.md](ROADMAP.md) for where it is going.
 
-GitHub's **Import repository** page (`github.com/new/import`) only works for repos
-hosted on another git server (GitLab, Bitbucket, Azure DevOps, etc.). It requires
-an internet-accessible URL — you **cannot** use it for a local repo on your machine.
+## The Auto Forge
 
-For a **local repo**, use the `push-to-github.sh` script in this repo:
+- **Blood Hound** researches the live web and turns findings into work orders.
+- **Forge Director** assigns each order to the best engineer, escalates struggles to Blood
+  Hound, and fails an order after 3 struggles so it surfaces to a human instead of looping.
+- **Engineers** (FORGE-1/2/3) each work in their own git worktree with file and command
+  tools. An order lands on the `atlas-forge` branch only when the full test suite passes.
+- **Budget**: every model call is priced; agents pause when the daily cap is reached.
+
+## Run it (Ubuntu)
 
 ```bash
-# From inside your local project directory:
-bash /path/to/push-to-github.sh https://github.com/yourname/your-repo.git
+git clone https://github.com/chrishazeleaf-jpg/codex-practice atlas && cd atlas
+python3 -m venv atlas_venv && source atlas_venv/bin/activate
+pip install -r requirements.txt
+python -m pytest -q                          # the forge refuses to land work unless this passes
+
+python atlas_app.py run --offline --interval 0.5 --duration 90   # free practice run, no API calls
+
+export ANTHROPIC_API_KEY=sk-ant-...
+python atlas_app.py run --budget 10 --push   # live: $10/day cap, pushes atlas-forge to GitHub
 ```
 
-### Manual steps (without the script)
+Other commands: `python atlas_app.py status`, `orders`, `add "title" "description"`.
 
-1. Create a new **empty** repo on GitHub (no README, no .gitignore): `https://github.com/new`
-2. In your terminal, navigate to your local project:
-   ```bash
-   cd /path/to/your/project
-   ```
-3. If not already a git repo:
-   ```bash
-   git init
-   git add -A
-   git commit -m "Initial commit"
-   ```
-4. Add GitHub as the remote and push:
-   ```bash
-   git remote add origin https://github.com/yourname/your-repo.git
-   git push -u origin main
-   ```
+What it produces, all under `atlas_data/`:
+- `output/<ID>.md`: what each engineer built
+- `research/*.md`: Blood Hound's research notes and sources
+- `spend.json`: cost per day per agent
+- `atlas.log`: the full log
 
-### When to use GitHub Import
+Review landed work with `git log main..atlas-forge`, and merge it to `main` when you're happy.
 
-Use `github.com/new/import` only when the source repo is hosted at a URL
-that GitHub can reach — e.g. a GitLab or Bitbucket repository.
+Engineer commands are restricted to an allowlist, but an engineer can still run arbitrary
+Python inside its worktree. For real isolation, run the forge in a container or VM.

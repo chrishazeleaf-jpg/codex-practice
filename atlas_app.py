@@ -40,37 +40,38 @@ def setup_logging(verbose: bool = False):
     logging.getLogger("anthropic").setLevel(logging.WARNING)
 
 
-def get_api_key() -> str:
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not key:
-        print("\n  ERROR: ANTHROPIC_API_KEY not set.\n")
-        print("  Set it with:")
-        print("    export ANTHROPIC_API_KEY=sk-ant-...")
-        print("  Then run:  python atlas_app.py\n")
-        sys.exit(1)
-    return key
-
-
 def cmd_run(args):
-    """Start the Auto Forge and run forever."""
+    """Start the Auto Forge."""
+    from pathlib import Path
+    from atlas.budget import Budget
+    from atlas.llm import make_client
+    from atlas.brain import ATLASBrain
+
     os.makedirs("atlas_data", exist_ok=True)
     setup_logging(args.verbose)
     print(BANNER)
 
-    from atlas.llm import make_client
-    from atlas.brain import ATLASBrain
+    budget = Budget(args.budget, Path("atlas_data/spend.json"))
+    try:
+        client = make_client(budget, offline=args.offline)
+    except Exception as e:
+        print(f"\n  Could not create the Anthropic client: {e}")
+        print("  Set a key with  export ANTHROPIC_API_KEY=sk-ant-...  or log in with  ant auth login")
+        print("  Or try the pipeline without one:  python atlas_app.py run --offline\n")
+        sys.exit(1)
 
-    client = make_client(offline=True) if args.offline else make_client(api_key=get_api_key())
-
-    print(f"  Mode:              {'OFFLINE SIMULATION (scripted responses, no API calls)' if args.offline else 'LIVE'}")
+    mode = "OFFLINE SIMULATION (scripted responses, no API calls)" if args.offline else "LIVE"
+    print(f"  Mode:              {mode}")
     print(f"  Model:             {args.model}")
+    print(f"  Daily budget:      {'unlimited' if args.budget <= 0 else f'${args.budget:.2f}'}"
+          f" (spent today: ${budget.spent_today():.2f})")
     print(f"  Research interval: every {args.interval:g} minutes")
     print(f"  Engineers:         FORGE-1, FORGE-2, FORGE-3")
-    print(f"  Results:           atlas_data/output/")
+    print(f"  Work lands on:     branch atlas-forge{' (pushed to origin)' if args.push else ''}")
     print()
 
     brain = ATLASBrain(client=client, model=args.model,
-                       research_interval_seconds=args.interval * 60)
+                       research_interval_seconds=args.interval * 60, push=args.push)
     brain.run_forever(duration=args.duration, status_every=args.status_every)
 
 
@@ -94,6 +95,9 @@ def cmd_status(args):
         bar = "█" * count + "░" * max(0, 10 - count)
         print(f"  {status.value:>16}  {bar}  {count}")
     print(f"  {'TOTAL':>16}  {'':10}  {total}")
+    from pathlib import Path
+    from atlas.budget import Budget
+    print(f"  Spent today: ${Budget(0, Path('atlas_data/spend.json')).spent_today():.2f}")
     print()
 
     recent = all_orders[:10]
@@ -166,7 +170,11 @@ def main():
 
     # run
     p_run = sub.add_parser("run", help="Start the Auto Forge (default)")
-    p_run.add_argument("--model", default="claude-sonnet-4-6", help="Anthropic model")
+    p_run.add_argument("--model", default="claude-opus-5-5", help="Anthropic model")
+    p_run.add_argument("--budget", type=float, default=10.0,
+                       help="Daily spend cap in USD; agents pause when it is reached (0 = no cap)")
+    p_run.add_argument("--push", action="store_true",
+                       help="Push the atlas-forge branch to origin after every landed order")
     p_run.add_argument("--interval", type=float, default=10,
                        help="Blood Hound research interval in minutes")
     p_run.add_argument("--offline", action="store_true",

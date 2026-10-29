@@ -1,49 +1,58 @@
 """
 ATLAS BRAIN — Central Orchestrator
 
-Brings up all agents, keeps them alive, reports status.
+Brings up the Forge, the engineers, the Director and Blood Hound, and reports status.
 """
 import logging
 import time
+from pathlib import Path
 from typing import List, Optional
 
-from .tracker import WorkOrderTracker
 from .bloodhound import BloodHound
 from .director import ForgeDirector
 from .engineer import Engineer
 from .models import WorkOrder, Priority
+from .tracker import WorkOrderTracker
+from .workspace import Forge
 
 log = logging.getLogger("BRAIN")
 
 
 class ATLASBrain:
-    def __init__(self, client, model: str = "claude-sonnet-4-6",
-                 research_interval_seconds: float = 600):
+    def __init__(self, client, model: str = "claude-opus-5-5",
+                 research_interval_seconds: float = 600, repo_root=".",
+                 data_dir=Path("atlas_data"), push: bool = False, poll: float = 2.0):
+        data_dir = Path(data_dir)
+        self.client = client
         self.model = model
-        self.tracker = WorkOrderTracker()
+        self.tracker = WorkOrderTracker(data_dir / "work_orders.db")
+        self.forge = Forge(repo_root, data_dir=data_dir, push=push)
 
-        self.engineers: List[Engineer] = [
-            Engineer("FORGE-1", self.tracker, client, model=model,
-                     specialties=["python", "architecture", "core systems", "agents", "memory"]),
-            Engineer("FORGE-2", self.tracker, client, model=model,
-                     specialties=["api integration", "web research", "data processing"]),
-            Engineer("FORGE-3", self.tracker, client, model=model,
-                     specialties=["ui", "debugging", "optimization", "self-healing"]),
+        roster = [
+            ("FORGE-1", ["python", "architecture", "core systems", "agents", "memory"]),
+            ("FORGE-2", ["api integration", "web research", "local ai", "data processing"]),
+            ("FORGE-3", ["ui", "debugging", "optimization", "self-healing", "testing"]),
         ]
-        self.director = ForgeDirector(self.tracker, client, self.engineers, model=model)
+        self.engineers: List[Engineer] = [
+            Engineer(name, self.tracker, client, self.forge, specialties=specs, model=model,
+                     output_dir=data_dir / "output", poll=poll)
+            for name, specs in roster
+        ]
+        self.director = ForgeDirector(self.tracker, client, self.engineers, model=model, poll=poll)
         self.bloodhound = BloodHound(self.tracker, client, model=model,
-                                     interval_seconds=research_interval_seconds)
+                                     interval_seconds=research_interval_seconds,
+                                     notes_dir=data_dir / "research")
         self.director.bloodhound = self.bloodhound
 
     def start(self):
         log.info("=" * 60)
         log.info("ATLAS BRAIN ONLINE")
         log.info("=" * 60)
+        log.info(f"Forge: worktrees under {self.forge.trees}, landing on branch {self.forge.branch}")
         for e in self.engineers:
             e.start()
         self.director.start()
         self.bloodhound.start()
-        log.info(f"Auto Forge active: {len(self.engineers)} engineers + director + blood hound")
 
     def stop(self):
         self.bloodhound.stop()
@@ -67,8 +76,9 @@ class ATLASBrain:
             for e in self.engineers
         )
         return (f"pending={wo.get('pending', 0)} working={wo.get('in_progress', 0)} "
-                f"blocked={wo.get('blocked', 0)} done={wo.get('complete', 0)} "
-                f"failed={wo.get('failed', 0)} | {engines} | hunts={self.bloodhound.cycles}")
+                f"blocked={wo.get('blocked', 0)} landed={wo.get('complete', 0)} "
+                f"failed={wo.get('failed', 0)} | {engines} | hunts={self.bloodhound.cycles} "
+                f"| spent today ${self.client.budget.spent_today():.2f}")
 
     def run_forever(self, duration: Optional[float] = None, status_every: float = 30):
         self.start()
